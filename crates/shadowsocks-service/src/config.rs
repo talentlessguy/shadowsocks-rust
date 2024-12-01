@@ -140,6 +140,8 @@ struct SSConfig {
     manager_address: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     manager_port: Option<u16>,
+     #[serde(skip_serializing_if = "Option::is_none")]
+    redir_port: Option<u16>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     password: Option<String>,
@@ -2237,7 +2239,6 @@ impl Config {
                 }
             }
         }
-
         // Manager Address
         if let Some(ma) = config.manager_address {
             let manager = match config.manager_port {

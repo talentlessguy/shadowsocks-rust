@@ -12,7 +12,10 @@ use log::{debug, error, info, trace, warn};
 use shadowsocks::{
     crypto::CipherKind,
     net::{AcceptOpts, TcpStream as OutboundTcpStream},
-    relay::tcprelay::{utils::copy_encrypted_bidirectional, ProxyServerStream},
+    relay::{
+        tcprelay::{utils::copy_encrypted_bidirectional, ProxyServerStream},
+        Address,
+    },
     ProxyListener, ServerConfig,
 };
 use tokio::{
@@ -20,6 +23,7 @@ use tokio::{
     net::TcpStream as TokioTcpStream,
     time,
 };
+use tokio_socks::{tcp::Socks5Stream, IntoTargetAddr};
 
 use crate::net::{utils::ignore_until_end, MonProxyStream};
 
@@ -58,8 +62,9 @@ impl TcpServer {
 
     /// Start server's accept loop
     pub async fn run(self) -> io::Result<()> {
+
         info!(
-            "shadowsocks tcp server listening on {}, inbound address {}",
+            "sss tcp server listening on {}, inbound address {}",
             self.listener.local_addr().expect("listener.local_addr"),
             self.svr_cfg.addr()
         );
@@ -103,15 +108,16 @@ impl TcpServer {
 }
 
 #[inline]
-async fn timeout_fut<F, R>(duration: Option<Duration>, f: F) -> io::Result<R>
+async fn timeout_fut<F, T, E>(duration: Option<Duration>, f: F) -> Result<T, E>
 where
-    F: Future<Output = io::Result<R>>,
+    F: Future<Output = Result<T, E>>,
+    E: From<std::io::Error>,
 {
     match duration {
         None => f.await,
         Some(d) => match time::timeout(d, f).await {
             Ok(o) => o,
-            Err(..) => Err(ErrorKind::TimedOut.into()),
+            Err(..) => Err(std::io::Error::from(ErrorKind::TimedOut).into()),
         },
     }
 }
@@ -129,13 +135,6 @@ impl TcpServerClient {
         // let target_addr = match Address::read_from(&mut self.stream).await {
         let target_addr = match timeout_fut(self.timeout, self.stream.handshake()).await {
             Ok(a) => a,
-            // Err(Socks5Error::IoError(ref err)) if err.kind() == ErrorKind::UnexpectedEof => {
-            //     debug!(
-            //         "handshake failed, received EOF before a complete target Address, peer: {}",
-            //         self.peer_addr
-            //     );
-            //     return Ok(());
-            // }
             Err(err) if err.kind() == ErrorKind::UnexpectedEof => {
                 debug!(
                     "tcp handshake failed, received EOF before a complete target Address, peer: {}",
@@ -201,6 +200,20 @@ impl TcpServerClient {
             return Ok(());
         }
 
+        let target_socket_addr = match &target_addr {
+            Address::SocketAddress(addr) => *addr,
+            Address::DomainNameAddress(ref domain, port) => self
+                .context
+                .dns_resolver()
+                .resolve(domain, *port)
+                .await?
+                .nth(0)
+                .unwrap(),
+        };
+
+        let proxy_addr = "127.0.0.1:1337".parse::<SocketAddr>().unwrap();
+        let _ = self.serve_cascade(proxy_addr, target_socket_addr).await;
+
         let mut remote_stream = match timeout_fut(
             self.timeout,
             OutboundTcpStream::connect_remote_with_opts(
@@ -245,7 +258,7 @@ impl TcpServerClient {
                     trace!(
                         "tcp tunnel {} -> {} sent TFO connect without data",
                         self.peer_addr,
-                        target_addr
+                        target_socket_addr
                     );
                 }
             }
@@ -254,7 +267,7 @@ impl TcpServerClient {
         debug!(
             "established tcp tunnel {} <-> {} with {:?}",
             self.peer_addr,
-            target_addr,
+            target_socket_addr,
             self.context.connect_opts_ref()
         );
 
@@ -263,7 +276,7 @@ impl TcpServerClient {
                 trace!(
                     "tcp tunnel {} <-> {} closed, L2R {} bytes, R2L {} bytes",
                     self.peer_addr,
-                    target_addr,
+                    target_socket_addr,
                     rn,
                     wn
                 );
@@ -272,12 +285,38 @@ impl TcpServerClient {
                 trace!(
                     "tcp tunnel {} <-> {} closed with error: {}",
                     self.peer_addr,
-                    target_addr,
+                    target_socket_addr,
                     err
                 );
             }
         }
 
         Ok(())
+    }
+
+    async fn serve_cascade<'a>(
+        &mut self,
+        proxy_addr: SocketAddr,
+        target: impl IntoTargetAddr<'a>,
+    ) -> std::io::Result<()> {
+        let mut remote_stream = timeout_fut(self.timeout, connect_proxy(proxy_addr, target)).await?;
+
+        copy_encrypted_bidirectional(self.method, &mut self.stream, &mut remote_stream).await?;
+
+        Ok(())
+    }
+}
+
+pub async fn connect_proxy<'a>(
+    proxy_addr: SocketAddr,
+    target: impl IntoTargetAddr<'a>,
+) -> std::io::Result<TokioTcpStream> {
+    match Socks5Stream::connect(proxy_addr, target).await {
+        Err(tokio_socks::Error::Io(io_err)) => Err(io_err),
+        Err(_) => Err(ErrorKind::Other.into()),
+        Ok(socket) => {
+            println!("socket: {:?}", socket);
+            Ok(socket.into_inner())
+        },
     }
 }
